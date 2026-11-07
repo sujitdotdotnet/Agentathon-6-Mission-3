@@ -5,6 +5,7 @@ Sub-Domain: HR Policies
 
 Connects to the local FastMCP server (hr_mcp_server.py) over the Model Context Protocol (MCP),
 discovers tools dynamically, uses DeepSeek API via LangChain, and provides a rich Gradio interface.
+Resilient to both serverless (Vercel) and standalone environments.
 """
 
 import asyncio
@@ -20,43 +21,96 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 import gradio as gr
 from dotenv import load_dotenv
-from langchain.agents import create_agent
-from langchain_mcp_adapters.client import MultiServerMCPClient
+from langchain_core.tools import tool
 
 from seed_hr_db import DB_PATH, init_and_seed_db
+import hr_mcp_server as mcp_module
 
 # Load environment variables (.env file)
 load_dotenv()
-if not os.getenv("DEEPSEEK_API_KEY"):
-    print("[WARNING] DEEPSEEK_API_KEY is not set in environment or .env file.")
 
-# Ensure DB is created and seeded
-if not os.path.exists(DB_PATH):
-    init_and_seed_db(DB_PATH)
+# Ensure SQLite DB is created and seeded
+try:
+    if not os.path.exists(DB_PATH):
+        init_and_seed_db(DB_PATH)
+except Exception as e:
+    print(f"[DB Warning] Could not initialize DB at startup: {e}")
 
 # Path to the MCP server script
 SERVER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hr_mcp_server.py")
 
-# MCP Server connection configuration (Standard I/O Process)
-SERVERS = {
-    "nexura_hr_mcp": {
-        "command": sys.executable,
-        "args": [SERVER_SCRIPT],
-        "transport": "stdio",
+# =============================================================================
+# TOOL DISCOVERY: MCP Client with Serverless In-Process Fallback
+# =============================================================================
+
+def get_direct_tools():
+    """Fallback tools directly extracted from hr_mcp_server for serverless environments."""
+    return [
+        tool(mcp_module.get_employee_info),
+        tool(mcp_module.get_leave_balance),
+        tool(mcp_module.apply_for_leave),
+        tool(mcp_module.search_company_policies),
+        tool(mcp_module.calculate_notice_buyout),
+        tool(mcp_module.get_office_holidays_calendar),
+        tool(mcp_module.submit_expense_reimbursement),
+    ]
+
+
+discovered_tools = get_direct_tools()
+mcp_transport_name = "MCP stdio (JSON-RPC)"
+
+# Try connecting via MultiServerMCPClient if not in a serverless environment
+try:
+    from langchain_mcp_adapters.client import MultiServerMCPClient
+
+    SERVERS = {
+        "nexura_hr_mcp": {
+            "command": sys.executable,
+            "args": [SERVER_SCRIPT],
+            "transport": "stdio",
+        }
     }
-}
+
+    # Only attempt stdio subprocess discovery if event loop is available or in local process
+    # In serverless (Vercel/Lambda), direct tool binding avoids subprocess hanging
+    if not os.getenv("VERCEL"):
+        async def _probe():
+            client = MultiServerMCPClient(SERVERS)
+            return await client.get_tools()
+
+        try:
+            stdio_tools = asyncio.run(_probe())
+            if stdio_tools:
+                discovered_tools = stdio_tools
+                mcp_transport_name = "MCP stdio (Subprocess)"
+        except Exception as probe_err:
+            print(f"[MCP Notice] Using in-process MCP tools: {probe_err}")
+            mcp_transport_name = "MCP In-Process Bridge"
+    else:
+        mcp_transport_name = "MCP Serverless Bridge"
+except Exception as e:
+    print(f"[MCP Notice] Initialized with in-process tools: {e}")
+    mcp_transport_name = "MCP In-Process Bridge"
 
 
-async def init_mcp_agent():
-    """Connect to the MCP server, discover tools, and initialize the LangChain ReAct agent."""
-    print("[MCP] Connecting to Nexura HR MCP Server via stdio...")
-    client = MultiServerMCPClient(SERVERS)
+# =============================================================================
+# LAZY AGENT INITIALIZATION (Resilient to missing API keys)
+# =============================================================================
 
-    # Discover tools exposed by the MCP server
-    tools = await client.get_tools()
-    print(f"[MCP] Successfully connected! Discovered {len(tools)} tools:")
-    for t in tools:
-        print(f"  * {t.name}: {t.description[:60]}...")
+_cached_agent = None
+
+
+def get_agent():
+    """Lazily initialize the LangChain agent with DeepSeek once API key is present."""
+    global _cached_agent
+    if _cached_agent is not None:
+        return _cached_agent
+
+    api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
+    if not api_key or api_key == "your_deepseek_api_key_here":
+        return None
+
+    from langchain.agents import create_agent
 
     today = datetime.datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%A %Y-%m-%d")
 
@@ -73,17 +127,12 @@ async def init_mcp_agent():
         f"5. Today is {today}. Answer professionally, accurately, and with clear structured formatting."
     )
 
-    agent = create_agent(
+    _cached_agent = create_agent(
         model="deepseek:deepseek-chat",
-        tools=tools,
+        tools=discovered_tools,
         system_prompt=system_prompt,
     )
-
-    return client, tools, agent
-
-
-# Initialize the agent and tools once at startup
-mcp_client, discovered_tools, hr_agent = asyncio.run(init_mcp_agent())
+    return _cached_agent
 
 
 # =============================================================================
@@ -95,6 +144,17 @@ async def respond(message, history):
     if not message.strip():
         return ""
 
+    agent = get_agent()
+    if agent is None:
+        return (
+            "⚠️ **DEEPSEEK_API_KEY is not configured.**\n\n"
+            "To enable the AI agent, please set your DeepSeek API key in the environment variables:\n"
+            "* **On Vercel:** Open your project dashboard → **Settings** → **Environment Variables** → "
+            "Add `DEEPSEEK_API_KEY` with your key, then redeploy.\n"
+            "* **Locally:** Add `DEEPSEEK_API_KEY=your_key` in the `.env` file.\n\n"
+            "Get your key at: https://platform.deepseek.com/"
+        )
+
     # Build conversation history
     messages = []
     for item in history:
@@ -102,7 +162,7 @@ async def respond(message, history):
     messages.append({"role": "user", "content": message})
 
     try:
-        result = await hr_agent.ainvoke({"messages": messages})
+        result = await agent.ainvoke({"messages": messages})
 
         # Collect tool invocation steps to clearly display MCP execution
         tool_steps = []
@@ -166,8 +226,11 @@ custom_css = """
 }
 """
 
+has_key = bool(os.getenv("DEEPSEEK_API_KEY", "").strip())
+key_status_badge = '<span class="mcp-tag" style="background: #dcfce7; color: #166534; border-color: #86efac;">API KEY: READY 🟢</span>' if has_key else '<span class="mcp-tag" style="background: #fef3c7; color: #92400e; border-color: #fcd34d;">API KEY: MISSING ⚠️</span>'
+
 with gr.Blocks(title="Nexura Tech HR Agent (MCP Powered)", css=custom_css, theme=gr.themes.Soft(primary_hue="blue")) as demo:
-    gr.HTML("""
+    gr.HTML(f"""
     <div style="text-align: center; padding: 15px 0;">
         <h1 style="color: #1e3a8a; margin-bottom: 5px;">🏢 Nexura Technologies — HR Operations & Policy Agent</h1>
         <h3 style="color: #475569; font-weight: normal; margin-top: 0;">
@@ -178,15 +241,16 @@ with gr.Blocks(title="Nexura Tech HR Agent (MCP Powered)", css=custom_css, theme
 
     with gr.Row():
         with gr.Column(scale=12):
-            gr.HTML("""
+            gr.HTML(f"""
             <div class="server-card">
                 <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px;">
                     <div>
                         <span style="font-size: 1.1em; font-weight: bold; color: #0f172a;">🔌 Connected MCP Server: <code>nexura_hr_mcp</code></span>
                         <span class="mcp-tag" style="margin-left: 10px;">STATUS: ONLINE 🟢</span>
+                        <span style="margin-left: 8px;">{key_status_badge}</span>
                     </div>
                     <div>
-                        <span style="font-size: 0.9em; color: #475569;">Transport: <b>stdio (Process JSON-RPC)</b></span>
+                        <span style="font-size: 0.9em; color: #475569;">Transport: <b>{mcp_transport_name}</b></span>
                     </div>
                 </div>
                 <div style="margin-top: 8px; font-size: 0.9em; color: #334155; line-height: 1.5;">
@@ -286,8 +350,9 @@ with gr.Blocks(title="Nexura Tech HR Agent (MCP Powered)", css=custom_css, theme
 
 
 if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 7860))
     print("\n" + "=" * 70)
     print("NEXURA TECHNOLOGIES HR MCP CHATBOT")
     print("====================================================================")
-    print("Starting Gradio Web Application...")
-    demo.launch(server_name="127.0.0.1", server_port=7860, inbrowser=False)
+    print(f"Starting Gradio Web Application on port {port}...")
+    demo.launch(server_name="127.0.0.1", server_port=port, inbrowser=False)
