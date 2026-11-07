@@ -22,5 +22,6 @@ dependencies = [
 py-modules = []
 
 [tool.vercel]
-entrypoint = "app.py"
+entrypoint = "app:app"
+
 
