@@ -106,3 +106,4 @@ Seeded via `seed_hr_db.py`:
    Every leave approval and expense submission updates the database with reference IDs and timestamps.
 4. **Cross-Client Interoperability:** 
    The same `hr_mcp_server.py` works out of the box with Gradio, Antigravity IDE, Claude Desktop, Cursor, or any custom client without modifying a single line of backend logic.
+
