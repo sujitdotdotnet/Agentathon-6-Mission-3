@@ -6,7 +6,20 @@ Software Service Company domain, HR Policies sub-domain.
 import os
 import sqlite3
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hr_portal.db")
+def get_default_db_path() -> str:
+    local_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hr_portal.db")
+    # Check if local directory is writable; on serverless platforms like Vercel, use /tmp
+    try:
+        test_file = local_path + ".writetest"
+        with open(test_file, "w") as f:
+            f.write("ok")
+        os.remove(test_file)
+        return local_path
+    except (OSError, PermissionError):
+        return os.path.join("/tmp", "hr_portal.db")
+
+
+DB_PATH = os.environ.get("DB_PATH", get_default_db_path())
 
 
 def init_and_seed_db(db_path: str = DB_PATH):

@@ -20,3 +20,7 @@ dependencies = [
 
 [tool.setuptools]
 py-modules = []
+
+[tool.vercel]
+entrypoint = "app.py"
+
