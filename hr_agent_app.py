@@ -345,8 +345,10 @@ with gr.Blocks(title="Nexura Tech HR Agent (MCP Powered)", css=custom_css, theme
         chat_history.append({"role": "assistant", "content": bot_response})
         return "", chat_history
 
-    msg_input.submit(user_submit, [msg_input, chatbot], [msg_input, chatbot])
-    submit_btn.click(user_submit, [msg_input, chatbot], [msg_input, chatbot])
+    # queue=False: single HTTP request per message, no persistent SSE queue stream.
+    # Gradio's queue needs a long-lived worker, which Vercel serverless does not keep alive.
+    msg_input.submit(user_submit, [msg_input, chatbot], [msg_input, chatbot], queue=False)
+    submit_btn.click(user_submit, [msg_input, chatbot], [msg_input, chatbot], queue=False)
 
 
 if __name__ == "__main__":
